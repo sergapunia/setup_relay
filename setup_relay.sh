@@ -3,30 +3,33 @@
 # Останавливаем скрипт при любой ошибке
 set -e
 
-# Проверяем, переданы ли аргументы
-if [ -z "$1" ] || [ -z "$2" ]; then
-  echo "❌ Ошибка: Не указаны IP или ПОРТ целевого сервера (PC2)."
-  echo "Использование: curl -sSL https://raw.githubusercontent.com/sergapunia/setup_relay/main/setup_relay.sh | bash -s -- <IP_PC2> <PORT_PC2>"
+# Проверяем, передан ли IP
+if [ -z "$1" ]; then
+  echo "❌ Ошибка: Не указан IP целевого сервера (PC2)."
+  echo "Использование: bash setup_relay.sh <IP_PC2>"
   exit 1
 fi
 
 CASCADE_IP=$1
-CASCADE_PORT=$2
 
-echo "🚀 Начинаем настройку реле на PC1..."
+# --- НАСТРОЙКА ДИАПАЗОНА ПОРТОВ ---
+# Здесь укажи порты, которые хочешь пробросить
+#PORTS=(443 4443 4444 4445 4446 4447 4448)
+# Или можно задать диапазоном: PORTS=$(seq 4440 4450)
+PORTS=$(seq 4440 5100)
+# ----------------------------------
 
-# 1. Обновление списков пакетов и установка HAProxy и Netcat (для проверки связи)
-sudo apt update
-sudo apt install -y haproxy netcat-openbsd
+echo "🚀 Настройка реле на PC1 для IP: $CASCADE_IP"
+echo "🔢 Будут проброшены порты: ${PORTS[*]}"
 
-# 2. Создание резервной копии старого конфига (если он есть)
-if [ -f /etc/haproxy/haproxy.cfg ]; then
-    sudo mv /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
-fi
+# 1. Установка HAProxy
+sudo apt update && sudo apt install -y haproxy netcat-openbsd
 
-# 3. Запись нового конфига через 'cat'
-# Мы используем кавычки вокруг "EOF", чтобы переменные внутри (CASCADE_IP) подставились из bash
-sudo bash -c "cat <<EOF > /etc/haproxy/haproxy.cfg
+# 2. Бекап старого конфига
+[ -f /etc/haproxy/haproxy.cfg ] && sudo mv /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
+
+# 3. Формируем базовую часть конфига
+cat <<EOF | sudo tee /etc/haproxy/haproxy.cfg > /dev/null
 global
     log /dev/log local0
     log /dev/log local1 notice
@@ -36,32 +39,37 @@ defaults
     log global
     mode tcp
     timeout connect 10s
-    timeout client  2m
-    timeout server  2m
+    timeout client  5m
+    timeout server  5m
+EOF
 
-frontend reality_in
-    bind *:443
-    default_backend cascade_out
+# 4. Циклом добавляем каждый порт в конфиг
+for PORT in ${PORTS[@]}; do
+    cat <<EOF | sudo tee -a /etc/haproxy/haproxy.cfg > /dev/null
 
-backend cascade_out
-    server cascade $CASCADE_IP:$CASCADE_PORT check
-EOF"
+frontend in_$PORT
+    bind *:$PORT
+    default_backend out_$PORT
 
-# 4. Включение в автозагрузку и запуск
+backend out_$PORT
+    server cascade_$PORT $CASCADE_IP:$PORT check
+EOF
+done
+
+# 5. Перезапуск
 sudo systemctl enable haproxy
 sudo systemctl restart haproxy
 
-# 5. Проверка статуса (кратко)
-echo "📊 Статус HAProxy:"
-sudo systemctl is-active haproxy
+echo "✅ HAProxy настроен!"
 
-# 6. Проверка связи с PC2
-echo "🔍 Проверка связи с $CASCADE_IP:$CASCADE_PORT..."
-# Используем nc для проверки порта. -z — скан, -w 5 — таймаут 5 сек
-if nc -vz -w 5 "$CASCADE_IP" "$CASCADE_PORT" 2>/dev/null; then
-    echo "✅ Связь установлена! PC1 успешно видит порт PC2."
-    echo "🔗 Теперь подключайся к PC1 ($HOSTNAME или IP) по порту 443."
-else
-    echo "⚠️ ВНИМАНИЕ: Не удалось достучаться до $CASCADE_IP:$CASCADE_PORT."
-    echo "Проверь, открыт ли порт $CASCADE_PORT в Firewall (Security Groups) на PC2."
-fi
+# 6. Проверка связи по каждому порту
+echo "🔍 Проверка доступности портов на $CASCADE_IP:"
+for PORT in ${PORTS[@]}; do
+    if nc -vz -w 3 "$CASCADE_IP" "$PORT" 2>/dev/null; then
+        echo "  [OK] Порт $PORT доступен"
+    else
+        echo "  [!!] Порт $PORT НЕ ОТВЕЧАЕТ (проверь Firewall на PC2)"
+    fi
+done
+
+echo "🔗 Настройка завершена. Используй IP этого сервера и порты из списка выше."
